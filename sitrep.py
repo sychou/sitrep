@@ -1254,9 +1254,14 @@ def do_run(providers: list[Provider], config: dict, args) -> int:
     SUMMARY_INFO = {"model": summary_provider.model, **su}
     SUMMARY_ISSUES = list(ISSUES)
 
+    multi = len(providers) > 1
     written: list[Path] = []
     for provider in providers:
-        base = " ".join(x for x in (args.label, provider.name) if x)
+        # Tag the filename by model only when comparing several. A single
+        # synthesis model is THE report (glm summaries + this model's brief),
+        # not a per-model variant, so it's just "Sitrep <date>".
+        parts = [args.label] + ([provider.name] if multi else [])
+        base = " ".join(x for x in parts if x)
         path = compose_one(Caller(provider, config), entries, journal,
                            since, until, base, config, args.kindle)
         if path:
