@@ -51,9 +51,12 @@
 # claims are never reported, and runs warn about them. A source listed in
 # two briefs appears in both. Per brief:
 #   title           — filename/display label (default: the section name)
-#   contextualizers — which to use (omitted = all configured)
+#   contextualizers — which to use (omitted = all configured; [] = none)
 #   focus           — standing angle steering topic extraction and synthesis
-#   kindle / kindle_sender — EPUB delivery for this brief (with --kindle)
+#   audience        — who the brief is for; set it for a third-person
+#                     analyst voice instead of a personal briefing
+#   kindle / kindle_sender — EPUB delivery for this brief (with --kindle);
+#                     briefs without them are skipped by --kindle
 
 # [brief.work]
 # title = "Work"

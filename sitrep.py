@@ -266,6 +266,49 @@ Related personal notes by topic:
 ---
 """
 
+# Used instead of BRIEF_PROMPT when a brief sets `audience` — an analyst's
+# voice for a readership, not a personal briefing for {name}.
+BRIEF_GENERAL_PROMPT = """\
+You are an expert analyst writing an intelligence briefing for {audience}. \
+Readers see only this brief, not the individual item summaries. Today is \
+{until}.
+
+You are given summaries of {count} external items filed since the last \
+report. Write a synthesized brief, not a list: weave the items together into \
+the developments that matter most to this audience, lead with the two or \
+three most significant, connect items that reinforce or contradict each \
+other, and let minor or off-topic items fall out of the themes (they are \
+listed separately). Write in a professional third-person analytical voice — \
+never address any individual reader.
+{focus}
+Provide:
+1. headline: one paragraph (4-6 sentences) on the most significant \
+developments and why they matter to this audience. Concrete and specific — \
+name the items, the actors, the numbers.
+2. themes: 2-5 themes. For each: a title; a detail paragraph (3-6 sentences) \
+citing concrete specifics from the items; sources (the exact external item \
+titles it draws on); related (exact supporting-note titles if any were \
+provided below — omit if none).
+3. action_items: 0-8 concrete, audience-appropriate follow-ups. Empty list \
+if none.
+
+Use exact item titles in `sources`. Be specific — cite numbers, names, claims.
+
+Return ONLY a JSON object of exactly this shape — no prose, no fences:
+
+{{
+  "headline": "string",
+  "themes": [{{"title": "string", "detail": "string",
+    "sources": ["string", ...], "related": ["string", ...]}}, ...],
+  "action_items": ["string", ...]
+}}
+
+External item summaries:
+---
+{digest}
+---
+{extra}"""
+
 
 # ── Schemas ─────────────────────────────────────────────────────────────────
 
@@ -358,6 +401,7 @@ class BriefDef:
     sources: set[str]               # slugs (or source names) this brief claims
     ctx_names: list[str] | None     # contextualizers used; None = all configured
     focus: str = ""                 # standing angle steering topics + synthesis
+    audience: str = ""              # who the brief is for; "" = personal voice
     kindle: str = ""                # per-brief Kindle address (used with --kindle)
     kindle_sender: str = ""         # per-brief sending account
 
@@ -488,6 +532,7 @@ def load_briefs(config: dict, ctxs: list[Ctx]) -> list[BriefDef]:
                      f"{', '.join(unknown)}")
         briefs.append(BriefDef(name, opts.get("title", name), set(sources), sel,
                                focus=opts.get("focus", ""),
+                               audience=opts.get("audience", ""),
                                kindle=opts.get("kindle", ""),
                                kindle_sender=opts.get("kindle_sender", "")))
     return briefs
@@ -930,7 +975,8 @@ def extract_topics(caller: Caller, entries: list[Entry], context: str,
         caller,
         TOPICS_PROMPT.format(
             name=NAME, count=len(entries), max_topics=MAX_TOPICS,
-            digest=item_digest(entries), context=context,
+            digest=item_digest(entries),
+            context=context or "(no recent personal context)",
             focus=focus_block(focus),
         ),
         Topics, max_tokens=2048, kind="topics",
@@ -1003,13 +1049,28 @@ def correlation_digest(correlations: dict[str, list[Hit]]) -> str:
 
 def build_brief(caller: Caller, entries: list[Entry], context: str,
                 correlations: dict[str, list[Hit]], until: str,
-                focus: str = "") -> Brief:
-    prompt = BRIEF_PROMPT.format(
-        name=NAME, count=len(entries), until=until,
-        digest=item_digest(entries), context=context,
-        correlations=correlation_digest(correlations),
-        focus=focus_block(focus),
-    )
+                focus: str = "", audience: str = "") -> Brief:
+    if audience:
+        # Audience voice: personal-context sections appear only when a
+        # contextualizer actually produced something.
+        extra = ""
+        if context:
+            extra += f"\nBackground context:\n---\n{context}\n---\n"
+        if correlations:
+            extra += ("\nSupporting notes by topic:\n---\n"
+                      f"{correlation_digest(correlations)}\n---\n")
+        prompt = BRIEF_GENERAL_PROMPT.format(
+            audience=audience, count=len(entries), until=until,
+            digest=item_digest(entries), focus=focus_block(focus), extra=extra,
+        )
+    else:
+        prompt = BRIEF_PROMPT.format(
+            name=NAME, count=len(entries), until=until,
+            digest=item_digest(entries),
+            context=context or "(no recent personal context)",
+            correlations=correlation_digest(correlations),
+            focus=focus_block(focus),
+        )
     return call_model(caller, prompt, Brief, max_tokens=16384, kind="brief")
 
 
@@ -1392,23 +1453,30 @@ def compose_one(caller: Caller, entries: list[Entry], context: str,
     ISSUES.clear()
     tag = f"[{caller.provider.name}] "
 
-    print(f"{tag}── correlate: extracting topics ({MODEL})")
-    try:
-        topics = extract_topics(caller, entries, context, brief_def.focus)
-    except Exception as e:  # noqa: BLE001
-        print(f"{tag}  topic extraction failed ({e}); proceeding without correlation")
-        record_issue("correlate", f"topic extraction failed — {str(e)[:160]}")
-        topics = []
-    if topics:
-        print(f"{tag}  topics: {', '.join(topics)}")
-    correlations = correlate(topics, ctxs)
-    print(f"{tag}  {sum(len(v) for v in correlations.values())} related note(s) "
-          f"across {len(correlations)} topic(s)")
+    # Topics exist to drive per-topic lookups; with no lookup-capable
+    # contextualizer on this brief, skip the extraction call entirely.
+    lookup = [c for c in ctxs if c.type in ("qmd", "msgvault")]
+    correlations: dict[str, list[Hit]] = {}
+    if lookup:
+        print(f"{tag}── correlate: extracting topics ({MODEL})")
+        try:
+            topics = extract_topics(caller, entries, context, brief_def.focus)
+        except Exception as e:  # noqa: BLE001
+            print(f"{tag}  topic extraction failed ({e}); proceeding without correlation")
+            record_issue("correlate", f"topic extraction failed — {str(e)[:160]}")
+            topics = []
+        if topics:
+            print(f"{tag}  topics: {', '.join(topics)}")
+        correlations = correlate(topics, lookup)
+        print(f"{tag}  {sum(len(v) for v in correlations.values())} related note(s) "
+              f"across {len(correlations)} topic(s)")
+    else:
+        print(f"{tag}── correlate: no lookup contextualizers on this brief — skipped")
 
     print(f"{tag}── compose: synthesizing the brief")
     try:
         brief = build_brief(caller, entries, context, correlations, until,
-                            brief_def.focus)
+                            brief_def.focus, brief_def.audience)
         path = write_report(entries, brief, correlations, since, until, label,
                             brief_def.name, [c.name for c in ctxs])
     except Exception as e:  # noqa: BLE001
@@ -1432,9 +1500,8 @@ def compose_one(caller: Caller, entries: list[Entry], context: str,
         address = brief_def.kindle or config.get("kindle")
         sender = brief_def.kindle_sender or config.get("kindle_sender")
         if not address or not sender:
-            missing = "kindle" if not address else "kindle_sender"
-            print(f"{tag}   kindle: no '{missing} = ...' in "
-                  f"[brief.{brief_def.name}] (or top level) of {CONFIG_FILE.name}")
+            # A brief without Kindle config just isn't a Kindle brief.
+            print(f"{tag}   kindle: not configured for [brief.{brief_def.name}] — skipped")
         else:
             try:
                 with tempfile.TemporaryDirectory() as tmp:
@@ -1573,7 +1640,7 @@ def do_run(providers: list[Provider], config: dict, args) -> int:
                 ambient_cache[ctx.name] = ctx_ambient(ctx)
             if ambient_cache[ctx.name]:
                 parts.append(ambient_cache[ctx.name])
-        return "\n\n".join(parts) or "(no personal context configured)"
+        return "\n\n".join(parts)
 
     since_floor = load_last_run()
     until = started.strftime("%Y-%m-%d")
