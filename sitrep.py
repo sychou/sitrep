@@ -10,15 +10,27 @@
 """Sitrep — a personalized daily briefing from the gumshoe archive.
 
 Gumshoe gathers, sitrep reports. Sitrep reads what gumshoe filed since the last
-report, works out the day's topics, cross-references them against Sean's own
-writing (the Obsidian journal and notes, via qmd), and composes one synthesized
-briefing: what the outside world said about things Sean is working on.
+report, works out the day's topics, cross-references them against the reader's
+own writing and archives (via configured contextualizers), and composes one or
+more synthesized briefings: what the outside world said about things the
+reader is working on.
 
-Four phases:
-  1. Collect   — gumshoe archive items not yet covered (by stable item_id), plus
-                 the recent daily journal for the relevance signal.
-  2. Correlate — extract topics from the day's material, then query qmd
-                 (obsidian + gumshoe collections) per topic for personal context.
+Briefs: [brief.*] config sections each name a subset of archive sources and
+get their own report and coverage; sources no brief claims fall into the
+catch-all default brief. Without any sections there is a single default brief
+covering everything.
+
+Contextualizers: [contextualizer.*] sections declare personal-context sources
+— "journal" (a folder of dated markdown), "qmd" (local note search), and
+"msgvault" (email/meeting archive search). Briefs pick which they use via
+contextualizers = [...]; without any sections the classic journal + qmd
+defaults apply.
+
+Four phases, per brief:
+  1. Collect   — archive items in the brief's sources not yet covered (by
+                 stable item_id), plus ambient context for the relevance signal.
+  2. Correlate — extract topics from the day's material, then query each
+                 lookup contextualizer per topic for personal context.
   3. Compose   — summarize each new item (cached), then synthesize the brief.
   4. Record    — mark items covered in state, only after the report is on disk.
 
@@ -28,9 +40,10 @@ gumshoe archive is read-only to sitrep. Model calls go to glm-5.2 on Ollama
 Cloud via its OpenAI-compatible API; requires OLLAMA_API_KEY in the environment.
 
 Usage:
-    sitrep run [--label morning|evening] [--kindle] [--journal-only] [--dry-run]
-    sitrep run --redo          # rebuild the last report from cached summaries
-    sitrep status              # coverage, last run, uncovered-item preview
+    sitrep run [--brief work,personal] [--label morning|evening] [--kindle]
+               [--journal-only] [--dry-run]
+    sitrep run --redo          # rebuild each brief's last report from cached summaries
+    sitrep status              # per-brief coverage, last run, uncovered preview
 """
 
 from __future__ import annotations
@@ -55,10 +68,12 @@ from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
 # ── Paths ───────────────────────────────────────────────────────────────────
-VAULT = Path.home() / "Vaults" / "Main"
-INBOX = VAULT / "Inbox"
-JOURNAL_DIR = VAULT / "Daily"
-GUMSHOE_VAULT = Path.home() / "Vaults" / "Gumshoe"
+# Defaults; overridden by the [paths] config section in apply_paths().
+DEFAULT_ARCHIVE = Path.home() / "Vaults" / "Gumshoe"
+DEFAULT_INBOX_COPY = Path.home() / "Vaults" / "Main" / "Inbox"
+DEFAULT_JOURNAL_DIR = Path.home() / "Vaults" / "Main" / "Daily"
+ARCHIVE = DEFAULT_ARCHIVE
+INBOX_COPY: Path | None = DEFAULT_INBOX_COPY
 
 # Yours, never written by the script.
 CONFIG_DIR = Path.home() / ".config" / "sitrep"
@@ -104,10 +119,13 @@ PROVIDERS: dict[str, Provider] = {
 MODEL_ATTEMPTS = 3
 
 JOURNAL_DAYS = 7          # how far back the journal signal reaches
-MAX_TOPICS = 8            # cap on extracted topics that get a qmd query
-QMD_HITS = 5              # correlation hits kept per topic per collection
+MAX_TOPICS = 8            # cap on extracted topics that get a correlation query
+QMD_HITS = 5              # correlation hits kept per topic per contextualizer
 SUMMARY_MAX_CHARS = 120_000
 JOURNAL_MAX_CHARS = 4_000  # per journal entry, into the topic/brief prompts
+
+# Whose briefing this is; the `name` config key personalizes the prompts.
+NAME = "the reader"
 
 SYSTEM_PROMPT = (
     "You are an expert analyst writing a personal intelligence briefing. "
@@ -118,7 +136,7 @@ SYSTEM_PROMPT = (
 
 SUMMARY_PROMPT = """\
 Summarize the following item for a personal briefing. It is external content \
-Sean has archived — a podcast/video transcript OR an email newsletter/article. \
+{name} has archived — a podcast/video transcript OR an email newsletter/article. \
 The text may be in any language; always produce your output in English.
 
 First decide what kind of item this is.
@@ -167,16 +185,17 @@ Item — {source} ({source_type}), "{title}":
 
 TOPICS_PROMPT = """\
 Below are summaries of {count} items the outside world produced recently, and \
-excerpts from Sean's own daily journal (what he is currently working on and \
-thinking about).
+excerpts from {name}'s own recent writing (what they are currently working on \
+and thinking about).
 
-Extract the TOPICS that connect the external items to what Sean cares about — \
-the things worth looking up in his personal knowledge base to find related \
+Extract the TOPICS that connect the external items to what {name} cares about — \
+the things worth looking up in their personal knowledge base to find related \
 notes, people, and projects. A topic is a short noun phrase (2-5 words): a \
 company, a person, a technology, a market, a thesis. Prefer topics that appear \
-in BOTH the external items and the journal, but include a purely-external topic \
-if it is clearly significant. Return at most {max_topics}, most important first.
-
+in BOTH the external items and the personal context, but include a \
+purely-external topic if it is clearly significant. Return at most \
+{max_topics}, most important first.
+{focus}
 Return ONLY a JSON object of exactly this shape — no prose, no fences:
 
 {{"topics": ["string", ...]}}
@@ -186,30 +205,32 @@ External item summaries:
 {digest}
 ---
 
-Recent journal:
+Recent personal context:
 ---
-{journal}
+{context}
 ---
 """
 
 BRIEF_PROMPT = """\
-You are writing Sean's personal briefing. He will read only this, not the \
+You are writing {name}'s personal briefing. They will read only this, not the \
 individual item summaries. Your job is to connect what the outside world said \
-today to what Sean is actively working on, thinking about, or has history with \
-— and to say plainly what does not connect to anything of his.
+today to what {name} is actively working on, thinking about, or has history \
+with — and to say plainly what does not connect to anything of theirs.
 
 You are given: summaries of {count} external items filed since the last report; \
-excerpts from Sean's recent daily journal; and, for each topic, related notes \
-pulled from his own knowledge base (title and an excerpt). Today is {until}.
+excerpts from {name}'s recent personal context (their own writing and \
+communications); and, for each topic, related notes pulled from their own \
+knowledge base and archives (title and an excerpt). Today is {until}.
 
 Write a synthesized brief, not a list. Weave the external items together and tie \
-them to Sean's context. Lead with the two or three things that most intersect \
-his active work. Where an item touches nothing in his journal or notes, do not \
-force a connection — leave it out of the themes (it will be listed separately).
-
+them to {name}'s context. Lead with the two or three things that most intersect \
+their active work. Where an item touches nothing in their context or notes, do \
+not force a connection — leave it out of the themes (it will be listed \
+separately).
+{focus}
 Provide:
 1. headline: one paragraph (4-6 sentences) on the two or three developments that \
-most intersect Sean's active work. Concrete, specific, personal — name the \
+most intersect {name}'s active work. Concrete, specific, personal — name the \
 items and the personal context.
 2. themes: 2-5 themes. For each: a title; a detail paragraph (3-6 sentences) \
 that cites concrete specifics from the external items AND names the personal \
@@ -217,7 +238,7 @@ context that makes it relevant; sources (the exact external item titles it draws
 on); related (the exact note titles from the knowledge base it connects to, as \
 given below — omit if none).
 3. action_items: 0-8 consolidated, concrete follow-ups, deduplicated across \
-items and the journal. Empty list if none.
+items and the personal context. Empty list if none.
 
 Use exact item titles in `sources` and exact note titles in `related`. Be \
 specific — cite numbers, names, claims.
@@ -236,9 +257,9 @@ External item summaries:
 {digest}
 ---
 
-Recent journal:
+Recent personal context:
 ---
-{journal}
+{context}
 ---
 
 Related personal notes by topic:
@@ -292,8 +313,9 @@ class Brief(BaseModel):
 class Item:
     """One gumshoe archive item, read straight from its markdown file."""
     item_id: str
-    source: str
-    source_type: str        # "youtube" | "newsletter"
+    source: str             # human source name from frontmatter
+    slug: str               # source folder name — the stable key briefs match on
+    source_type: str        # "youtube" | "newsletter" | "podcast"
     title: str
     url: str
     published: str          # YYYY-MM-DD
@@ -311,11 +333,33 @@ class Entry:
 
 @dataclass
 class Hit:
-    """One qmd correlation hit — a note from Sean's own knowledge base."""
+    """One correlation hit — a note or message from the reader's own
+    knowledge base or archives."""
     title: str
     note: str               # note name for a [[wikilink]]
-    collection: str
+    collection: str         # provenance label (contextualizer name / collection)
     snippet: str
+    wiki: bool = True       # False → render as plain text, not a [[wikilink]]
+
+
+@dataclass
+class Ctx:
+    """One configured contextualizer — a personal-context source a brief can
+    draw on. Two capabilities: ambient (a date-window digest fed into the
+    topic and brief prompts) and lookup (per-topic correlation hits)."""
+    name: str               # config section name; provenance label
+    type: str               # "journal" | "qmd" | "msgvault"
+    opts: dict
+
+
+@dataclass
+class BriefDef:
+    """One configured brief — a named report over a subset of archive sources."""
+    name: str                       # config section name ("work"), or "default"
+    title: str                      # filename/display label ("" for the default brief)
+    sources: set[str] | None        # slugs claimed; None = catch-all
+    ctx_names: list[str] | None     # contextualizers used; None = all configured
+    focus: str = ""                 # standing angle steering topics + synthesis
 
 
 @dataclass
@@ -391,6 +435,94 @@ def load_config() -> dict:
         return tomllib.load(fh)
 
 
+def apply_paths(config: dict) -> None:
+    """Resolve the [paths] section onto the module globals. Without the
+    section, everything keeps its historical default; with it, only what the
+    section names is used (an absent inbox_copy means no vault copy)."""
+    global ARCHIVE, INBOX_COPY, NAME
+    NAME = config.get("name", NAME)
+    paths = config.get("paths")
+    if paths is None:
+        return
+    ARCHIVE = Path(paths.get("archive", DEFAULT_ARCHIVE)).expanduser()
+    INBOX_COPY = Path(paths["inbox_copy"]).expanduser() if "inbox_copy" in paths else None
+
+
+def load_contextualizers(config: dict) -> list[Ctx]:
+    """Configured [contextualizer.*] sections, or — when none exist — the two
+    implicit defaults that reproduce the pre-contextualizer behavior (journal
+    + qmd over the obsidian collection). msgvault is never implicit."""
+    raw = config.get("contextualizer")
+    if raw is None:
+        return [
+            Ctx("journal", "journal",
+                {"dir": str(DEFAULT_JOURNAL_DIR), "days": JOURNAL_DAYS}),
+            Ctx("notes", "qmd", {"collection": "obsidian", "hits": QMD_HITS}),
+        ]
+    ctxs: list[Ctx] = []
+    for name, opts in raw.items():
+        ctype = opts.get("type", "")
+        if ctype not in ("journal", "qmd", "msgvault"):
+            sys.exit(f"[contextualizer.{name}]: unknown type {ctype!r} "
+                     "(expected journal, qmd, or msgvault)")
+        if ctype == "journal" and not opts.get("dir"):
+            sys.exit(f"[contextualizer.{name}]: journal type needs dir = \"...\"")
+        ctxs.append(Ctx(name, ctype, dict(opts)))
+    return ctxs
+
+
+def brief_ctxs(brief: BriefDef, ctxs: list[Ctx]) -> list[Ctx]:
+    if brief.ctx_names is None:
+        return ctxs
+    return [c for c in ctxs if c.name in brief.ctx_names]
+
+
+def load_briefs(config: dict, ctxs: list[Ctx]) -> list[BriefDef]:
+    """Configured [brief.*] sections plus the catch-all default brief. With no
+    sections at all, the single default brief has an empty title so filenames
+    and output match the pre-brief behavior exactly."""
+    raw = config.get("brief")
+    if not raw:
+        return [BriefDef("default", "", None, None)]
+    known = {c.name for c in ctxs}
+    briefs: list[BriefDef] = []
+    for name, opts in raw.items():
+        if name == "default":
+            sys.exit("[brief.default] is reserved for the catch-all brief; "
+                     "pick another name")
+        sources = opts.get("sources")
+        if not sources:
+            sys.exit(f"[brief.{name}] needs a non-empty sources = [...] list")
+        sel = opts.get("contextualizers")
+        if sel and (unknown := [c for c in sel if c not in known]):
+            sys.exit(f"[brief.{name}] references unknown contextualizer(s): "
+                     f"{', '.join(unknown)}")
+        briefs.append(BriefDef(name, opts.get("title", name), set(sources), sel,
+                               focus=opts.get("focus", "")))
+    # The catch-all keeps the classic unlabeled "Sitrep <date>" name; its
+    # frontmatter still says brief: default.
+    briefs.append(BriefDef("default", "", None, None))
+    return briefs
+
+
+def partition_items(items: list[Item], briefs: list[BriefDef]) -> dict[str, list[Item]]:
+    """Assign each archive item to every brief that claims its source (slug or
+    human name); the catch-all default gets whatever no explicit brief claims."""
+    claimed: set[str] = set()
+    for b in briefs:
+        if b.sources:
+            claimed |= b.sources
+    out: dict[str, list[Item]] = {}
+    for b in briefs:
+        if b.sources is None:
+            out[b.name] = [i for i in items
+                           if i.slug not in claimed and i.source not in claimed]
+        else:
+            out[b.name] = [i for i in items
+                           if i.slug in b.sources or i.source in b.sources]
+    return out
+
+
 def load_state() -> dict:
     try:
         return json.loads(STATE_FILE.read_text(encoding="utf-8"))
@@ -418,23 +550,53 @@ def save_last_run(when: datetime) -> None:
     save_state(state)
 
 
-def reported_ids() -> dict[str, str]:
-    """Item IDs a report has already covered, mapped to the report that did."""
-    return load_state().get("reported", {})
-
-
-def mark_reported(entries: list[Entry], report_name: str) -> int:
+def migrate_state(briefs: list[BriefDef]) -> None:
+    """Bring state.json up to the per-brief shape. The v1 flat reported map
+    is copied into every brief — coverage's only job is never-re-report, and
+    per-brief semantics matter only going forward. A brief added later is
+    seeded from the union of existing coverage for the same reason: a config
+    change must never re-report the whole archive under a new name."""
     state = load_state()
-    reported = state.setdefault("reported", {})
+    reported = state.get("reported", {})
+    changed = False
+    if reported and any(isinstance(v, str) for v in reported.values()):
+        reported = {b.name: dict(reported) for b in briefs}
+        changed = True
+    if reported:
+        union: dict[str, str] = {}
+        for per_brief in reported.values():
+            union.update(per_brief)
+        for b in briefs:
+            if b.name not in reported:
+                reported[b.name] = dict(union)
+                changed = True
+    last = state.get("last_report")
+    if isinstance(last, dict) and "name" in last:
+        state["last_report"] = {"default": last}
+        changed = True
+    if changed:
+        state["reported"] = reported
+        save_state(state)
+
+
+def reported_ids(brief_name: str) -> dict[str, str]:
+    """Item IDs a report of this brief has already covered, mapped to the
+    report that did."""
+    return load_state().get("reported", {}).get(brief_name, {})
+
+
+def mark_reported(entries: list[Entry], report_name: str, brief_name: str) -> int:
+    state = load_state()
+    reported = state.setdefault("reported", {}).setdefault(brief_name, {})
     for e in entries:
         reported[e.item.item_id] = report_name
     save_state(state)
     return len(entries)
 
 
-def unmark_reported(item_ids: set[str]) -> int:
+def unmark_reported(item_ids: set[str], brief_name: str) -> int:
     state = load_state()
-    reported = state.get("reported", {})
+    reported = state.get("reported", {}).get(brief_name, {})
     dropped = [i for i in item_ids if reported.pop(i, None) is not None]
     save_state(state)
     return len(dropped)
@@ -500,9 +662,9 @@ def collect_items() -> list[Item]:
     """Every gumshoe archive item, read from its markdown. Oldest fetched first
     so the digest and windowing read chronologically."""
     items: list[Item] = []
-    if not GUMSHOE_VAULT.is_dir():
+    if not ARCHIVE.is_dir():
         return items
-    for path in sorted(GUMSHOE_VAULT.glob("*/*.md")):
+    for path in sorted(ARCHIVE.glob("*/*.md")):
         front, body = split_frontmatter(path.read_text(encoding="utf-8"))
         item_id = front.get("item_id")
         if not item_id:
@@ -514,6 +676,7 @@ def collect_items() -> list[Item]:
         items.append(Item(
             item_id=item_id,
             source=front.get("source", path.parent.name),
+            slug=path.parent.name,
             source_type=front.get("source_type", "unknown"),
             title=front.get("title", path.stem),
             url=front.get("url", ""),
@@ -526,19 +689,19 @@ def collect_items() -> list[Item]:
     return items
 
 
-def uncovered_items() -> list[Item]:
-    covered = reported_ids()
-    return [i for i in collect_items() if i.item_id not in covered]
+def uncovered_for(items: list[Item], brief_name: str) -> list[Item]:
+    covered = reported_ids(brief_name)
+    return [i for i in items if i.item_id not in covered]
 
 
-def read_journal(days: int = JOURNAL_DAYS) -> list[tuple[date, str]]:
+def read_journal(journal_dir: Path, days: int = JOURNAL_DAYS) -> list[tuple[date, str]]:
     """Recent daily journal entries, oldest first. Bounded to the year folders
     the window spans so it never walks two decades of Daily/."""
     today = datetime.now().astimezone().date()
     cutoff = today - timedelta(days=days)
     entries: list[tuple[date, str]] = []
     for year in sorted({cutoff.year, today.year}):
-        ydir = JOURNAL_DIR / str(year)
+        ydir = journal_dir / str(year)
         if not ydir.is_dir():
             continue
         for path in ydir.rglob("*.md"):
@@ -561,6 +724,63 @@ def journal_text(entries: list[tuple[date, str]]) -> str:
         f"Journal {d.isoformat()}:\n{text.strip()[:JOURNAL_MAX_CHARS]}"
         for d, text in entries
     ) or "(no recent journal entries)"
+
+
+# ── Contextualizers ─────────────────────────────────────────────────────────
+# Each contextualizer can contribute in two places: ambient context (a
+# date-window digest fed into the topic and brief prompts) and per-topic
+# lookup (correlation hits). A type implements whichever fits.
+
+def ctx_ambient(ctx: Ctx) -> str | None:
+    if ctx.type != "journal":
+        return None
+    entries = read_journal(Path(ctx.opts["dir"]).expanduser(),
+                           int(ctx.opts.get("days", JOURNAL_DAYS)))
+    return journal_text(entries)
+
+
+def ctx_lookup(ctx: Ctx, topic: str) -> list[Hit]:
+    if ctx.type == "qmd":
+        return qmd_query(topic, ctx.opts.get("collection", "obsidian"),
+                         int(ctx.opts.get("hits", QMD_HITS)))
+    if ctx.type == "msgvault":
+        return msgvault_query(topic, ctx)
+    return []
+
+
+def msgvault_query(topic: str, ctx: Ctx) -> list[Hit]:
+    """Search the msgvault archive (email, meetings, messages) for a topic.
+    Failure is non-fatal — correlation is augmentation, not the spine."""
+    query = f'"{topic}" newer_than:{ctx.opts.get("window", "30d")}'
+    cmd = ["msgvault", "search", query, "--json",
+           "-n", str(int(ctx.opts.get("hits", QMD_HITS))),
+           "--mode", ctx.opts.get("mode", "hybrid")]
+    if types := ctx.opts.get("message_types"):
+        cmd += ["--message-type", ",".join(types)]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              timeout=60, check=False)
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        record_issue("correlate", f"msgvault {ctx.name} '{topic}' — {type(e).__name__}")
+        return []
+    if proc.returncode != 0:
+        record_issue("correlate",
+                     f"msgvault {ctx.name} '{topic}' — {proc.stderr.strip()[:120]}")
+        return []
+    try:
+        rows = json.loads(proc.stdout) if proc.stdout.strip() else []
+    except json.JSONDecodeError:
+        return []
+    hits = []
+    for r in rows:
+        subject = (r.get("subject") or "").strip() or "(no subject)"
+        sender = (r.get("from_name") or r.get("from_email") or "").strip()
+        sent = (r.get("sent_at") or "")[:10]
+        title = " — ".join(x for x in (subject, sender, sent) if x)
+        snippet = " ".join((r.get("snippet") or "").split())[:280]
+        hits.append(Hit(title=title, note="", collection=ctx.name,
+                        snippet=snippet, wiki=False))
+    return hits
 
 
 # ── Model calls (ported from youscribe) ─────────────────────────────────────
@@ -684,7 +904,7 @@ def summarize_item(caller: Caller, item: Item) -> Summary:
     summary = call_model(
         caller,
         SUMMARY_PROMPT.format(
-            source=item.source, source_type=item.source_type,
+            name=NAME, source=item.source, source_type=item.source_type,
             title=item.title, body=item.body[:SUMMARY_MAX_CHARS],
         ),
         Summary, kind="summary",
@@ -712,12 +932,19 @@ def item_digest(entries: list[Entry]) -> str:
     return "\n".join(blocks)
 
 
-def extract_topics(caller: Caller, entries: list[Entry], journal: str) -> list[str]:
+def focus_block(focus: str) -> str:
+    """The optional per-brief steering paragraph for the prompts."""
+    return f"\nThis brief has a standing focus: {focus}\n" if focus else ""
+
+
+def extract_topics(caller: Caller, entries: list[Entry], context: str,
+                   focus: str = "") -> list[str]:
     result = call_model(
         caller,
         TOPICS_PROMPT.format(
-            count=len(entries), max_topics=MAX_TOPICS,
-            digest=item_digest(entries), journal=journal,
+            name=NAME, count=len(entries), max_topics=MAX_TOPICS,
+            digest=item_digest(entries), context=context,
+            focus=focus_block(focus),
         ),
         Topics, max_tokens=2048, kind="topics",
     )
@@ -757,17 +984,19 @@ def qmd_query(topic: str, collection: str, n: int = QMD_HITS) -> list[Hit]:
     return hits
 
 
-def correlate(topics: list[str]) -> dict[str, list[Hit]]:
-    """Per topic, the personal notes it surfaces from the obsidian collection.
-    Deduped by note within a topic; the gumshoe collection is skipped here since
-    the day's items are already the external side."""
+def correlate(topics: list[str], ctxs: list[Ctx]) -> dict[str, list[Hit]]:
+    """Per topic, the personal notes and messages the brief's contextualizers
+    surface. Deduped by note/title within a topic. The gumshoe archive itself
+    is never a contextualizer — the day's items are already the external side."""
     out: dict[str, list[Hit]] = {}
     for topic in topics:
         seen, hits = set(), []
-        for hit in qmd_query(topic, "obsidian"):
-            if hit.note and hit.note not in seen:
-                seen.add(hit.note)
-                hits.append(hit)
+        for ctx in ctxs:
+            for hit in ctx_lookup(ctx, topic):
+                key = hit.note or hit.title
+                if key and key not in seen:
+                    seen.add(key)
+                    hits.append(hit)
         if hits:
             out[topic] = hits
     return out
@@ -785,12 +1014,14 @@ def correlation_digest(correlations: dict[str, list[Hit]]) -> str:
 
 # ── Phase 3: Compose ────────────────────────────────────────────────────────
 
-def build_brief(caller: Caller, entries: list[Entry], journal: str,
-                correlations: dict[str, list[Hit]], until: str) -> Brief:
+def build_brief(caller: Caller, entries: list[Entry], context: str,
+                correlations: dict[str, list[Hit]], until: str,
+                focus: str = "") -> Brief:
     prompt = BRIEF_PROMPT.format(
-        count=len(entries), until=until,
-        digest=item_digest(entries), journal=journal,
+        name=NAME, count=len(entries), until=until,
+        digest=item_digest(entries), context=context,
         correlations=correlation_digest(correlations),
+        focus=focus_block(focus),
     )
     return call_model(caller, prompt, Brief, max_tokens=16384, kind="brief")
 
@@ -828,8 +1059,23 @@ def link_sources(titles: list[str], urls: dict[str, str]) -> str:
     return ", ".join(out)
 
 
+def render_related(names: list[str], correlations: dict[str, list[Hit]]) -> str:
+    """Render the model-cited related titles: wikilinks for notes, plain text
+    for hits (like msgvault messages) that have no note behind them."""
+    hit_map: dict[str, Hit] = {}
+    for hits in correlations.values():
+        for h in hits:
+            hit_map.setdefault(h.title.strip().lower(), h)
+    out = []
+    for n in names:
+        h = hit_map.get(n.strip().lower())
+        out.append(n if (h and not h.wiki) else f"[[{n}]]")
+    return ", ".join(out)
+
+
 def write_report(entries: list[Entry], brief: Brief, correlations: dict[str, list[Hit]],
-                 since: str, until: str, label: str) -> Path:
+                 since: str, until: str, label: str, brief_name: str,
+                 ctx_names: list[str]) -> Path:
     urls = url_map(entries)
     featured = featured_titles(brief)
     also = [e for e in entries if not is_featured(e.item, featured)]
@@ -841,9 +1087,11 @@ def write_report(entries: list[Entry], brief: Brief, correlations: dict[str, lis
         "kind:",
         "  - report",
         "report: sitrep",
+        f"brief: {brief_name}",
         f"date: {until}",
         f"covering-from: {since}",
         *([f"label: {label}"] if label else []),
+        f"contextualizers: {json.dumps(ctx_names)}",
         f"items: {len(entries)}",
         f"profiles: {len(profiles)}",
         f"tokens: {usage_totals()['total']}",
@@ -869,7 +1117,7 @@ def write_report(entries: list[Entry], brief: Brief, correlations: dict[str, lis
             if theme.sources:
                 lines.append(f"*External: {link_sources(theme.sources, urls)}*")
             if theme.related:
-                lines.append(f"*Related: {', '.join(f'[[{n}]]' for n in theme.related)}*")
+                lines.append(f"*Related: {render_related(theme.related, correlations)}*")
             if theme.sources or theme.related:
                 lines.append("")
 
@@ -1104,11 +1352,21 @@ def build_epub(entries: list[Entry], brief: Brief, since: str, until: str,
     return path
 
 
-def send_to_kindle(path: Path, address: str, sender: str, until: str) -> None:
+# How the EPUB reaches the Kindle: any command template works; each element is
+# formatted with {to}, {sender}, {subject}, {file}. Override with
+# kindle_send_cmd = [...] in config.
+DEFAULT_KINDLE_SEND_CMD = [
+    "gog", "gmail", "send", "--account", "{sender}", "--to", "{to}",
+    "--subject", "{subject}", "--body", "Sent by sitrep.", "--attach", "{file}",
+]
+
+
+def send_to_kindle(path: Path, address: str, sender: str, subject: str,
+                   config: dict) -> None:
+    template = config.get("kindle_send_cmd", DEFAULT_KINDLE_SEND_CMD)
+    subs = {"to": address, "sender": sender, "subject": subject, "file": str(path)}
     subprocess.run(
-        ["gog", "gmail", "send", "--account", sender, "--to", address,
-         "--subject", f"Sitrep {until}", "--body", "Sent by sitrep.",
-         "--attach", str(path)],
+        [part.format(**subs) for part in template],
         check=True, capture_output=True, text=True,
     )
 
@@ -1135,9 +1393,9 @@ def resolve_provider(name: str) -> Provider:
     return PROVIDERS[key]
 
 
-def compose_one(caller: Caller, entries: list[Entry], journal: str,
-                since: str, until: str, label: str, config: dict,
-                kindle: bool) -> Path | None:
+def compose_one(caller: Caller, entries: list[Entry], context: str,
+                ctxs: list[Ctx], since: str, until: str, label: str,
+                brief_def: BriefDef, config: dict, kindle: bool) -> Path | None:
     """Correlate + synthesize + write for one synthesis model over shared,
     pre-computed summaries. Only the synthesis model's tokens are spent here;
     the shared summary cost is folded into the report via SUMMARY_INFO."""
@@ -1149,32 +1407,36 @@ def compose_one(caller: Caller, entries: list[Entry], journal: str,
 
     print(f"{tag}── correlate: extracting topics ({MODEL})")
     try:
-        topics = extract_topics(caller, entries, journal)
+        topics = extract_topics(caller, entries, context, brief_def.focus)
     except Exception as e:  # noqa: BLE001
         print(f"{tag}  topic extraction failed ({e}); proceeding without correlation")
         record_issue("correlate", f"topic extraction failed — {str(e)[:160]}")
         topics = []
     if topics:
         print(f"{tag}  topics: {', '.join(topics)}")
-    correlations = correlate(topics)
+    correlations = correlate(topics, ctxs)
     print(f"{tag}  {sum(len(v) for v in correlations.values())} related note(s) "
           f"across {len(correlations)} topic(s)")
 
     print(f"{tag}── compose: synthesizing the brief")
     try:
-        brief = build_brief(caller, entries, journal, correlations, until)
-        path = write_report(entries, brief, correlations, since, until, label)
+        brief = build_brief(caller, entries, context, correlations, until,
+                            brief_def.focus)
+        path = write_report(entries, brief, correlations, since, until, label,
+                            brief_def.name, [c.name for c in ctxs])
     except Exception as e:  # noqa: BLE001
         print(f"{tag}report FAILED ({e}); items stay uncovered")
         return None
 
-    vault_copy = INBOX / path.name
-    if INBOX.is_dir():
+    if INBOX_COPY is not None and INBOX_COPY.is_dir():
+        vault_copy = INBOX_COPY / path.name
         shutil.copyfile(path, vault_copy)
+    else:
+        vault_copy = None
     use = usage_totals()
     synth = use["total"]
     print(f"{tag}   report: {path}")
-    if INBOX.is_dir():
+    if vault_copy is not None:
         print(f"{tag}   vault:  {vault_copy}")
     print(f"{tag}done: {len(entries)} item(s); {synth:,} synthesis tokens "
           f"(+{SUMMARY_INFO.get('prompt', 0) + SUMMARY_INFO.get('completion', 0):,} shared summaries)")
@@ -1189,7 +1451,7 @@ def compose_one(caller: Caller, entries: list[Entry], journal: str,
                 with tempfile.TemporaryDirectory() as tmp:
                     epub = build_epub(entries, brief, since, until, label,
                                       Path(tmp) / f"{path.stem}.epub")
-                    send_to_kindle(epub, address, sender, path.stem)
+                    send_to_kindle(epub, address, sender, path.stem, config)
                 print(f"{tag}   kindle: sent to {address}")
             except subprocess.CalledProcessError as e:
                 print(f"{tag}   kindle: send failed — {(e.stderr or '').strip()[:200]}")
@@ -1198,58 +1460,53 @@ def compose_one(caller: Caller, entries: list[Entry], journal: str,
     return path
 
 
-def do_run(providers: list[Provider], config: dict, args) -> int:
-    started = datetime.now().astimezone()
+def run_brief(brief: BriefDef, items: list[Item], providers: list[Provider],
+              ctxs: list[Ctx], context: str, since_floor: datetime | None,
+              until: str, config: dict, args) -> int:
+    """One brief: reopen on --redo, filter coverage, summarize, compose per
+    provider, record. Returns the number of reports written, or -1 on failure."""
+    tag = f"[{brief.name}] "
 
     redo_ids: set[str] | None = None
     if args.redo:
-        last = load_state().get("last_report")
+        last = (load_state().get("last_report") or {}).get(brief.name)
         if not last or not last.get("items"):
-            sys.exit("No previous report recorded in state.json — nothing to redo.")
+            print(f"{tag}no previous report recorded — nothing to redo")
+            return 0
         redo_ids = set(last["items"])
-        unmark_reported(redo_ids)
-        print(f"reopened {len(redo_ids)} item(s) from {last.get('name', 'the last report')}")
+        unmark_reported(redo_ids, brief.name)
+        print(f"{tag}reopened {len(redo_ids)} item(s) from {last.get('name', 'the last report')}")
 
-    items = uncovered_items()
+    pending = uncovered_for(items, brief.name)
     if redo_ids is not None:
         # --redo rebuilds exactly the last report — not the whole backlog.
-        items = [i for i in items if i.item_id in redo_ids]
-    total = len(items)
+        pending = [i for i in pending if i.item_id in redo_ids]
+    total = len(pending)
     if args.limit and total > args.limit:
-        items = items[-args.limit:]
-        print(f"── collect: {len(items)} of {total} uncovered item(s) (--limit {args.limit})")
+        pending = pending[-args.limit:]
+        print(f"{tag}── collect: {len(pending)} of {total} uncovered item(s) "
+              f"(--limit {args.limit})")
     else:
-        print(f"── collect: {total} uncovered item(s) in the gumshoe archive")
-    if not items and not args.journal_only:
-        print("done: nothing new since the last report — no report written "
-              "(use --journal-only to brief over the journal alone)")
+        print(f"{tag}── collect: {total} uncovered item(s)")
+    if not pending and not args.journal_only:
+        print(f"{tag}nothing new since the last report — no report written")
         return 0
 
-    journal = journal_text(read_journal())
-
-    if args.dry_run:
-        print(f"── would run {[p.name for p in providers]} over {len(items)} item(s)")
-        for item in items:
-            print(f"  {item.published or '?'} | {item.source} — {item.title}")
-        print(f"── journal: {len(read_journal())} recent entr(y/ies) in reach")
-        return 0
-
-    last_run = load_last_run()
-    until = started.strftime("%Y-%m-%d")
-    earliest = min((i.published for i in items if i.published), default="")
-    since = (min(last_run.strftime("%Y-%m-%d"), earliest or until) if last_run
+    earliest = min((i.published for i in pending if i.published), default="")
+    since = (min(since_floor.strftime("%Y-%m-%d"), earliest or until) if since_floor
              else earliest or until)
 
-    # ── Summarize once on the cheap model; every synthesis report shares it. ──
+    # ── Summarize once on the cheap model; every synthesis report shares it,
+    # and the per-model cache makes items shared between briefs free. ──
     global SUMMARY_INFO, SUMMARY_ISSUES
     summary_provider = resolve_provider(config.get("summary_model", "glm"))
     USAGE.clear()
     ISSUES.clear()
-    print(f"── summarize: {len(items)} item(s) with {summary_provider.model} (shared)")
-    entries = summarize_all(Caller(summary_provider, config), items)
+    print(f"{tag}── summarize: {len(pending)} item(s) with {summary_provider.model} (shared)")
+    entries = summarize_all(Caller(summary_provider, config), pending)
     if not entries:
-        print(f"done: none of {len(items)} item(s) summarized — no report")
-        return 1
+        print(f"{tag}none of {len(pending)} item(s) summarized — no report")
+        return -1
     su = usage_totals()["stages"].get("summary", {"calls": 0, "prompt": 0, "completion": 0})
     SUMMARY_INFO = {"model": summary_provider.model, **su}
     SUMMARY_ISSUES = list(ISSUES)
@@ -1257,47 +1514,123 @@ def do_run(providers: list[Provider], config: dict, args) -> int:
     multi = len(providers) > 1
     written: list[Path] = []
     for provider in providers:
-        # Tag the filename by model only when comparing several. A single
-        # synthesis model is THE report (glm summaries + this model's brief),
-        # not a per-model variant, so it's just "Sitrep <date>".
-        parts = [args.label] + ([provider.name] if multi else [])
+        # Tag the filename by brief, then by model only when comparing several.
+        # The default brief keeps the classic unlabeled "Sitrep <date>" name.
+        parts = [brief.title, args.label] + ([provider.name] if multi else [])
         base = " ".join(x for x in parts if x)
-        path = compose_one(Caller(provider, config), entries, journal,
-                           since, until, base, config, args.kindle)
+        path = compose_one(Caller(provider, config), entries, context, ctxs,
+                           since, until, base, brief, config, args.kindle)
         if path:
             written.append(path)
 
     if not written:
-        print("\ndone: no reports written; items stay uncovered and are retried")
-        return 1
+        print(f"\n{tag}no reports written; items stay uncovered and are retried")
+        return -1
 
     # Commit once: items are covered regardless of which model reported them.
-    save_last_run(started)
     state = load_state()
-    state["last_report"] = {"name": written[-1].name,
-                            "items": [e.item.item_id for e in entries]}
+    state.setdefault("last_report", {})[brief.name] = {
+        "name": written[-1].name,
+        "items": [e.item.item_id for e in entries]}
     save_state(state)
-    marked = mark_reported(entries, written[-1].name)
-    print(f"\n── record: {marked} item(s) marked covered across {len(written)} report(s)")
-    return 0
+    marked = mark_reported(entries, written[-1].name, brief.name)
+    print(f"\n{tag}── record: {marked} item(s) marked covered "
+          f"across {len(written)} report(s)")
+    return len(written)
 
 
-def do_status() -> int:
+def select_briefs(briefs: list[BriefDef], args) -> list[BriefDef]:
+    if args.brief:
+        wanted = [b.strip() for b in args.brief.split(",") if b.strip()]
+        by_name = {b.name: b for b in briefs}
+        if unknown := [w for w in wanted if w not in by_name]:
+            sys.exit(f"unknown brief(s): {', '.join(unknown)}; "
+                     f"configured: {', '.join(by_name)}")
+        return [by_name[w] for w in wanted]
+    if args.journal_only:
+        # N identical context-only reports would be pointless; run just the
+        # default brief unless --brief says otherwise.
+        return [b for b in briefs if b.name == "default"]
+    return briefs
+
+
+def do_run(providers: list[Provider], config: dict, args) -> int:
+    started = datetime.now().astimezone()
+    ctxs = load_contextualizers(config)
+    briefs = load_briefs(config, ctxs)
+    migrate_state(briefs)
+    selected = select_briefs(briefs, args)
+
+    all_items = collect_items()
+    partition = partition_items(all_items, briefs)
+
+    if args.dry_run:
+        for brief in selected:
+            pending = uncovered_for(partition[brief.name], brief.name)
+            names = ", ".join(c.name for c in brief_ctxs(brief, ctxs)) or "none"
+            print(f"── brief {brief.name}: {len(pending)} uncovered item(s); "
+                  f"contextualizers: {names}")
+            for item in pending:
+                print(f"  {item.published or '?'} | {item.source} — {item.title}")
+        print(f"── would run {[p.name for p in providers]}")
+        return 0
+
+    # Ambient context memoized by contextualizer, so the journal is read once
+    # however many briefs share it.
+    ambient_cache: dict[str, str | None] = {}
+
+    def context_for(brief: BriefDef) -> str:
+        parts = []
+        for ctx in brief_ctxs(brief, ctxs):
+            if ctx.name not in ambient_cache:
+                ambient_cache[ctx.name] = ctx_ambient(ctx)
+            if ambient_cache[ctx.name]:
+                parts.append(ambient_cache[ctx.name])
+        return "\n\n".join(parts) or "(no personal context configured)"
+
+    since_floor = load_last_run()
+    until = started.strftime("%Y-%m-%d")
+
+    total_written = 0
+    failed = False
+    for brief in selected:
+        result = run_brief(brief, partition[brief.name], providers,
+                           brief_ctxs(brief, ctxs), context_for(brief),
+                           since_floor, until, config, args)
+        if result < 0:
+            failed = True
+        else:
+            total_written += result
+
+    if total_written:
+        save_last_run(started)
+    return 1 if failed else 0
+
+
+def do_status(config: dict) -> int:
+    ctxs = load_contextualizers(config)
+    briefs = load_briefs(config, ctxs)
+    migrate_state(briefs)
     state = load_state()
     print(f"state: {STATE_FILE}")
     print(f"last run: {state.get('last_run', 'never')}")
-    reported = state.get("reported", {})
-    print(f"covered: {len(reported)} item(s)")
-    last = state.get("last_report")
-    if last:
-        print(f"last report: {last.get('name')} ({len(last.get('items', []))} items)")
-    pending = uncovered_items()
-    print(f"\nuncovered: {len(pending)} item(s)")
-    for item in pending[:12]:
-        print(f"  {item.published or '?':10}  {item.source_type:10}  "
-              f"{item.source} — {item.title[:60]}")
-    if len(pending) > 12:
-        print(f"  ... and {len(pending) - 12} more")
+    partition = partition_items(collect_items(), briefs)
+    last_reports = state.get("last_report") or {}
+    for b in briefs:
+        srcs = "catch-all" if b.sources is None else f"{len(b.sources)} source(s)"
+        names = ", ".join(c.name for c in brief_ctxs(b, ctxs)) or "none"
+        covered = len(reported_ids(b.name))
+        pending = uncovered_for(partition[b.name], b.name)
+        print(f"\nbrief {b.name} ({srcs}; contextualizers: {names})")
+        print(f"  covered: {covered} item(s)")
+        if last := last_reports.get(b.name):
+            print(f"  last report: {last.get('name')} ({len(last.get('items', []))} items)")
+        print(f"  uncovered: {len(pending)} item(s)")
+        for item in pending[:12]:
+            print(f"    {item.published or '?':10}  {item.source_type:10}  "
+                  f"{item.source} — {item.title[:60]}")
+        if len(pending) > 12:
+            print(f"    ... and {len(pending) - 12} more")
     return 0
 
 
@@ -1306,12 +1639,15 @@ def main() -> None:
     sub = parser.add_subparsers(dest="cmd")
 
     run = sub.add_parser("run", help="collect, correlate, compose, record")
+    run.add_argument("--brief", default="",
+                     help="comma-separated brief names to run (default: all configured briefs)")
     run.add_argument("--label", default="", help="report label, e.g. morning or evening")
     run.add_argument("--models", default="",
                      help="comma-separated providers to run, one report each "
                           f"(available: {', '.join(sorted(PROVIDERS))}; default: config or glm)")
     run.add_argument("--kindle", action="store_true", help="also email each report as an EPUB to the Kindle")
-    run.add_argument("--journal-only", action="store_true", help="brief over the journal even with no new items")
+    run.add_argument("--journal-only", action="store_true",
+                     help="brief over the personal context alone even with no new items")
     run.add_argument("--redo", action="store_true", help="rebuild the last report from cached summaries")
     run.add_argument("--dry-run", action="store_true", help="collect + preview only; no model calls or writes")
     run.add_argument("--limit", type=int, default=None,
@@ -1320,13 +1656,15 @@ def main() -> None:
     sub.add_parser("status", help="coverage, last run, uncovered items")
     args = parser.parse_args()
 
+    config = load_config()
+    apply_paths(config)
+
     if args.cmd == "status":
-        sys.exit(do_status())
+        sys.exit(do_status(config))
     if args.cmd != "run":
         parser.print_help()
         sys.exit(0)
 
-    config = load_config()
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
 
     if cm := config.get("claude_model"):  # e.g. "claude-sonnet-5"

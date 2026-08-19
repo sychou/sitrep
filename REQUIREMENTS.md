@@ -3,15 +3,41 @@
 Status: draft for review, 2026-08-07
 
 Sitrep writes the daily report. It reads what gumshoe gathered, works out
-what is news today, cross-references it against Sean's own writing and
-history, and produces one personally relevant briefing: what the outside
-world said about things Sean is actively working on, thinking about, or has
+what is news today, cross-references it against the reader's own writing and
+history, and produces personally relevant briefings: what the outside world
+said about things the reader is actively working on, thinking about, or has
 history with.
 
 Gumshoe gathers, sitrep reports. The two share one interface — the gumshoe
 archive and its qmd index — and nothing else. Sitrep is the successor to
 youscribe's reporting half (the rollup, EPUB, and Kindle delivery); the
 generic cross-show rollup becomes a personalized brief.
+
+## Briefs
+
+`[brief.*]` config sections define named reports, each claiming a subset of
+archive sources (by gumshoe folder slug). Each brief has its own report file,
+its own coverage map, and its own choice of contextualizers. Sources no brief
+claims fall into a catch-all default brief, so nothing silently disappears; a
+source listed in two briefs appears in both. With no sections configured
+there is a single default brief covering everything — the original behavior.
+
+## Contextualizers
+
+Personal context reaches the pipeline only through configured contextualizer
+instances (`[contextualizer.*]`), each with a type:
+
+- `journal` — a folder of dated markdown files; contributes ambient context
+  (a date-window digest fed into the topic and brief prompts).
+- `qmd` — local note search; contributes per-topic correlation lookups.
+- `msgvault` — email/meeting archive search; per-topic lookups over a
+  recency window, rendered with plain-text provenance (subject, sender,
+  date) rather than wikilinks.
+
+Briefs select contextualizers by name; omitting the key means all configured
+ones. With no sections configured, implicit defaults reproduce the classic
+journal + qmd behavior. This keeps every personal integration optional —
+a public install with no vault and no msgvault simply configures none.
 
 ## What "news for the day" means
 
@@ -20,8 +46,9 @@ Sitrep determines the day's material by date across several corpora:
 - The gumshoe archive is the anchor. It carries the most news-driven data
   points — transcripts, articles, newsletters filed since the last report —
   and every run starts from what is new there.
-- The daily journal says what Sean is currently working on and thinking
-  about. It is the primary signal for relevance, not a source of news.
+- The daily journal says what the reader is currently working on and
+  thinking about. It is the primary signal for relevance, not a source of
+  news.
 - Email and Slack augment: recent messages can confirm that a topic is live
   (a thread about a vendor, a channel discussing an announcement) and can
   contribute items the archive lacks.
@@ -32,11 +59,11 @@ topics are known.
 
 ## The report
 
-One markdown document per run. Working structure, inherited in part from
-youscribe and expected to evolve:
+One markdown document per brief per run. Working structure, inherited in
+part from youscribe and expected to evolve:
 
 - a headline paragraph: the two or three things today that most intersect
-  with Sean's active work
+  with the reader's active work
 - themes: each connecting external items to the personal context that makes
   them relevant ("All-In covered X; you wrote about X in Tuesday's journal;
   your note on Y from March is related"), with links to sources on both
@@ -73,31 +100,36 @@ A run has four phases:
    disk. A run that fails before writing records nothing and the next run
    re-covers it.
 
-Like youscribe, coverage is tracked in sitrep's own `state.json` as a map of
-item ID to the report that covered it. Gumshoe's archive is read-only to
-sitrep; sitrep never writes outside its own data dir, the vault Inbox, and
-outbound mail.
+Like youscribe, coverage is tracked in sitrep's own `state.json`, per brief:
+a map of brief name to {item ID → the report that covered it}. Older flat
+state migrates in place on first run (the flat map is copied into every
+brief; a brief added later is seeded from the union of existing coverage, so
+a config change never re-reports the archive). Gumshoe's archive is
+read-only to sitrep; sitrep never writes outside its own data dir, the
+configured inbox-copy folder, and outbound mail.
 
 ## Layout
 
 ```text
-~/.config/sitrep/config.toml       # kindle addresses, model, source toggles
+~/.config/sitrep/config.toml       # paths, name, models, kindle,
+                                   # [contextualizer.*], [brief.*]
 ~/.local/share/sitrep/
-    state.json                     # coverage map, last run
-    reports/Sitrep <date>.md       # every report ever written
+    state.json                     # per-brief coverage maps, last run
+    reports/Sitrep <brief> <date>.md   # every report ever written
 ```
+
+`config.example.toml` in the repo documents every key.
 
 ## Interfaces
 
 - Gumshoe archive: read the files directly (frontmatter carries source,
-  date, URL, stable ID) and search them via the `gumshoe` qmd collection.
-- Vault: journal and notes via the `obsidian` qmd collection; direct file
-  reads for the most recent journal entries.
-- Email: via msgvault (recent-message queries), not Gmail directly —
-  msgvault is the system of record and already handles identity resolution.
-- Slack: mechanism open — see open questions.
-- Model: an OpenAI-compatible API, as in youscribe. Which model is an open
-  question.
+  date, URL, stable ID); the archive path comes from `[paths] archive`.
+- All personal context (vault notes, journal, email/meetings) flows through
+  configured contextualizers — see the Contextualizers section. Nothing
+  personal is hardwired.
+- Slack: mechanism open — see open questions (a future contextualizer type).
+- Model: an OpenAI-compatible API or native Anthropic, per the provider
+  registry; `summary_model` and `models` pick them.
 
 ## Behavior notes
 
@@ -124,8 +156,10 @@ outbound mail.
   first is zero-maintenance, the second is steerable.
 - Slack access. The claude.ai Slack MCP is interactive; a scheduled script
   needs its own token. Is Slack worth a v1 slot, or a later augmentation?
-- Email sweep scope. Which msgvault queries define "recent email that
-  signals a live topic" without dragging in the whole inbox?
+  If added, it would be a new contextualizer type.
+- msgvault ambient mode. The msgvault contextualizer does per-topic lookup
+  only; a recent-window digest (ambient) mode is possible but dumps more
+  personal text into prompts for unclear gain.
 - Relevance threshold. When a new item touches nothing in the journal or
   PKM, does it still get a line in the report (youscribe-style coverage), or
   is it dropped? Dropping is what makes the brief personal; covering
