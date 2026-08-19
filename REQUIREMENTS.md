@@ -17,10 +17,11 @@ generic cross-show rollup becomes a personalized brief.
 
 `[brief.*]` config sections define named reports, each claiming a subset of
 archive sources (by gumshoe folder slug). Each brief has its own report file,
-its own coverage map, and its own choice of contextualizers. Sources no brief
-claims fall into a catch-all default brief, so nothing silently disappears; a
-source listed in two briefs appears in both. With no sections configured
-there is a single default brief covering everything — the original behavior.
+its own coverage map, its own choice of contextualizers, an optional standing
+`focus`, and optional per-brief Kindle delivery. Briefs are explicit-only:
+at least one must be configured, sources no brief claims are never reported
+(runs and status warn about them), and a source listed in two briefs appears
+in both.
 
 ## Contextualizers
 
@@ -35,9 +36,9 @@ instances (`[contextualizer.*]`), each with a type:
   date) rather than wikilinks.
 
 Briefs select contextualizers by name; omitting the key means all configured
-ones. With no sections configured, implicit defaults reproduce the classic
-journal + qmd behavior. This keeps every personal integration optional —
-a public install with no vault and no msgvault simply configures none.
+ones. Nothing is implicit — the code carries no personal paths or defaults,
+so a public install with no vault and no msgvault simply configures none and
+briefs run without personal context.
 
 ## What "news for the day" means
 

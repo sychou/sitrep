@@ -1,9 +1,7 @@
 # Sitrep configuration — copy to ~/.config/sitrep/config.toml and edit.
-# Every key is optional; with no config at all, sitrep reads the default
-# archive path, uses the classic journal + qmd contextualizers, and writes a
-# single unlabeled brief.
+# At least one [brief.*] section is required; everything else is optional.
 
-# Whose briefing this is; personalizes the prompts.
+# Whose briefing this is; personalizes the prompts (default: "the reader").
 # name = "Alex"
 
 # Models. Providers: glm (Ollama Cloud), openai, claude.
@@ -12,38 +10,33 @@
 # openai_model = "gpt-5.2"       # override a provider's model id
 # claude_model = "claude-opus-5"
 
-# Kindle delivery (used with `sitrep run --kindle`).
-# kindle = "you_123@kindle.com"
-# kindle_sender = "your-gog-account"
-# How the EPUB is emailed; each element is formatted with {to}, {sender},
-# {subject}, {file}. Default uses the gog CLI:
-# kindle_send_cmd = ["gog", "gmail", "send", "--account", "{sender}",
-#                    "--to", "{to}", "--subject", "{subject}",
-#                    "--body", "Sent by sitrep.", "--attach", "{file}"]
-
-# Paths. Without this section the historical defaults apply (gumshoe archive
-# at ~/Vaults/Gumshoe, report copy to ~/Vaults/Main/Inbox). With the section,
-# omitting inbox_copy disables the vault copy.
+# Paths. archive defaults to gumshoe's own default vault; the report copy
+# into a second folder happens only when inbox_copy is set.
 # [paths]
 # archive = "~/Vaults/Gumshoe"
 # inbox_copy = "~/Vaults/Main/Inbox"
+
+# How a Kindle EPUB is emailed (used with `sitrep run --kindle` for briefs
+# that set kindle/kindle_sender); each element is formatted with {to},
+# {sender}, {subject}, {file}. Default uses the gog CLI:
+# kindle_send_cmd = ["gog", "gmail", "send", "--account", "{sender}",
+#                    "--to", "{to}", "--subject", "{subject}",
+#                    "--body", "Sent by sitrep.", "--attach", "{file}"]
 
 # Contextualizers — personal-context sources briefs can draw on. Types:
 #   journal  — a folder of dated markdown files (ambient context)
 #   qmd      — local markdown note search, per-topic lookup
 #   msgvault — email/meeting archive search, per-topic lookup
-# With no [contextualizer.*] sections, the implicit defaults reproduce the
-# classic behavior: a "journal" over ~/Vaults/Main/Daily plus a "notes" qmd
-# lookup over the obsidian collection. msgvault is never implicit.
+# Nothing is implicit: configure what you have, briefs pick by name.
 
 # [contextualizer.journal]
 # type = "journal"
-# dir = "~/Vaults/Main/Daily"
+# dir = "~/notes/daily"
 # days = 7
 
 # [contextualizer.notes]
 # type = "qmd"
-# collection = "obsidian"
+# collection = "notes"
 # hits = 5
 
 # [contextualizer.email]
@@ -54,20 +47,18 @@
 # message_types = ["email", "meeting_transcript"]   # omit for all types
 
 # Briefs — named reports over subsets of archive sources (gumshoe folder
-# slugs; human source names also match). Sources no brief claims fall into
-# the catch-all default brief, which keeps the classic unlabeled report name.
-# A source listed in two briefs appears in both. Each brief may pick its
-# contextualizers; omitted means all configured ones.
-
-# A brief may also carry a standing `focus` — a sentence or two steering
-# topic extraction and synthesis toward the angle the brief exists for.
+# slugs; human source names also match). Explicit only: sources no brief
+# claims are never reported, and runs warn about them. A source listed in
+# two briefs appears in both. Per brief:
+#   title           — filename/display label (default: the section name)
+#   contextualizers — which to use (omitted = all configured)
+#   focus           — standing angle steering topic extraction and synthesis
+#   kindle / kindle_sender — EPUB delivery for this brief (with --kindle)
 
 # [brief.work]
 # title = "Work"
 # sources = ["bytebytego", "hfs-research"]
 # contextualizers = ["journal", "notes", "email"]
 # focus = "Track what matters for enterprise AI adoption decisions."
-
-# [brief.personal]
-# title = "Personal"
-# sources = ["all-in-podcast", "investanswers"]
+# kindle = "you_123@kindle.com"
+# kindle_sender = "your-gog-account"

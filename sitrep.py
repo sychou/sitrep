@@ -16,15 +16,15 @@ more synthesized briefings: what the outside world said about things the
 reader is working on.
 
 Briefs: [brief.*] config sections each name a subset of archive sources and
-get their own report and coverage; sources no brief claims fall into the
-catch-all default brief. Without any sections there is a single default brief
-covering everything.
+get their own report, coverage, optional standing focus, and optional Kindle
+delivery. Briefs are explicit-only — at least one must be configured, and
+sources no brief claims are never reported (runs warn about them).
 
 Contextualizers: [contextualizer.*] sections declare personal-context sources
 — "journal" (a folder of dated markdown), "qmd" (local note search), and
 "msgvault" (email/meeting archive search). Briefs pick which they use via
-contextualizers = [...]; without any sections the classic journal + qmd
-defaults apply.
+contextualizers = [...]; omitted means all configured ones. Nothing is
+implicit: with no sections, briefs run with no personal context.
 
 Four phases, per brief:
   1. Collect   — archive items in the brief's sources not yet covered (by
@@ -69,11 +69,9 @@ from pydantic import BaseModel, Field, ValidationError
 
 # ── Paths ───────────────────────────────────────────────────────────────────
 # Defaults; overridden by the [paths] config section in apply_paths().
-DEFAULT_ARCHIVE = Path.home() / "Vaults" / "Gumshoe"
-DEFAULT_INBOX_COPY = Path.home() / "Vaults" / "Main" / "Inbox"
-DEFAULT_JOURNAL_DIR = Path.home() / "Vaults" / "Main" / "Daily"
+DEFAULT_ARCHIVE = Path.home() / "Vaults" / "Gumshoe"   # gumshoe's own default
 ARCHIVE = DEFAULT_ARCHIVE
-INBOX_COPY: Path | None = DEFAULT_INBOX_COPY
+INBOX_COPY: Path | None = None  # report copy destination; only via [paths]
 
 # Yours, never written by the script.
 CONFIG_DIR = Path.home() / ".config" / "sitrep"
@@ -355,11 +353,13 @@ class Ctx:
 @dataclass
 class BriefDef:
     """One configured brief — a named report over a subset of archive sources."""
-    name: str                       # config section name ("work"), or "default"
-    title: str                      # filename/display label ("" for the default brief)
-    sources: set[str] | None        # slugs claimed; None = catch-all
+    name: str                       # config section name ("work")
+    title: str                      # filename/display label
+    sources: set[str]               # slugs (or source names) this brief claims
     ctx_names: list[str] | None     # contextualizers used; None = all configured
     focus: str = ""                 # standing angle steering topics + synthesis
+    kindle: str = ""                # per-brief Kindle address (used with --kindle)
+    kindle_sender: str = ""         # per-brief sending account
 
 
 @dataclass
@@ -436,29 +436,20 @@ def load_config() -> dict:
 
 
 def apply_paths(config: dict) -> None:
-    """Resolve the [paths] section onto the module globals. Without the
-    section, everything keeps its historical default; with it, only what the
-    section names is used (an absent inbox_copy means no vault copy)."""
+    """Resolve the [paths] section onto the module globals. archive defaults
+    to gumshoe's own default vault; the report copy happens only when
+    inbox_copy is configured."""
     global ARCHIVE, INBOX_COPY, NAME
     NAME = config.get("name", NAME)
-    paths = config.get("paths")
-    if paths is None:
-        return
+    paths = config.get("paths") or {}
     ARCHIVE = Path(paths.get("archive", DEFAULT_ARCHIVE)).expanduser()
     INBOX_COPY = Path(paths["inbox_copy"]).expanduser() if "inbox_copy" in paths else None
 
 
 def load_contextualizers(config: dict) -> list[Ctx]:
-    """Configured [contextualizer.*] sections, or — when none exist — the two
-    implicit defaults that reproduce the pre-contextualizer behavior (journal
-    + qmd over the obsidian collection). msgvault is never implicit."""
-    raw = config.get("contextualizer")
-    if raw is None:
-        return [
-            Ctx("journal", "journal",
-                {"dir": str(DEFAULT_JOURNAL_DIR), "days": JOURNAL_DAYS}),
-            Ctx("notes", "qmd", {"collection": "obsidian", "hits": QMD_HITS}),
-        ]
+    """Configured [contextualizer.*] sections. Nothing is implicit: with no
+    sections, briefs run with no personal context."""
+    raw = config.get("contextualizer") or {}
     ctxs: list[Ctx] = []
     for name, opts in raw.items():
         ctype = opts.get("type", "")
@@ -478,18 +469,16 @@ def brief_ctxs(brief: BriefDef, ctxs: list[Ctx]) -> list[Ctx]:
 
 
 def load_briefs(config: dict, ctxs: list[Ctx]) -> list[BriefDef]:
-    """Configured [brief.*] sections plus the catch-all default brief. With no
-    sections at all, the single default brief has an empty title so filenames
-    and output match the pre-brief behavior exactly."""
+    """Configured [brief.*] sections. Briefs are explicit-only: every report
+    is one someone defined, and sources no brief claims are never reported
+    (do_run and do_status warn about them)."""
     raw = config.get("brief")
     if not raw:
-        return [BriefDef("default", "", None, None)]
+        sys.exit(f"No [brief.*] sections in {CONFIG_FILE} — define at least "
+                 "one brief with a sources = [...] list (see config.example.toml).")
     known = {c.name for c in ctxs}
     briefs: list[BriefDef] = []
     for name, opts in raw.items():
-        if name == "default":
-            sys.exit("[brief.default] is reserved for the catch-all brief; "
-                     "pick another name")
         sources = opts.get("sources")
         if not sources:
             sys.exit(f"[brief.{name}] needs a non-empty sources = [...] list")
@@ -498,29 +487,27 @@ def load_briefs(config: dict, ctxs: list[Ctx]) -> list[BriefDef]:
             sys.exit(f"[brief.{name}] references unknown contextualizer(s): "
                      f"{', '.join(unknown)}")
         briefs.append(BriefDef(name, opts.get("title", name), set(sources), sel,
-                               focus=opts.get("focus", "")))
-    # The catch-all keeps the classic unlabeled "Sitrep <date>" name; its
-    # frontmatter still says brief: default.
-    briefs.append(BriefDef("default", "", None, None))
+                               focus=opts.get("focus", ""),
+                               kindle=opts.get("kindle", ""),
+                               kindle_sender=opts.get("kindle_sender", "")))
     return briefs
 
 
 def partition_items(items: list[Item], briefs: list[BriefDef]) -> dict[str, list[Item]]:
     """Assign each archive item to every brief that claims its source (slug or
-    human name); the catch-all default gets whatever no explicit brief claims."""
+    human name). Items no brief claims are simply not reported."""
+    return {b.name: [i for i in items
+                     if i.slug in b.sources or i.source in b.sources]
+            for b in briefs}
+
+
+def unclaimed_sources(items: list[Item], briefs: list[BriefDef]) -> list[str]:
+    """Archive sources no brief claims, as 'slug' strings for a warning."""
     claimed: set[str] = set()
     for b in briefs:
-        if b.sources:
-            claimed |= b.sources
-    out: dict[str, list[Item]] = {}
-    for b in briefs:
-        if b.sources is None:
-            out[b.name] = [i for i in items
-                           if i.slug not in claimed and i.source not in claimed]
-        else:
-            out[b.name] = [i for i in items
-                           if i.slug in b.sources or i.source in b.sources]
-    return out
+        claimed |= b.sources
+    return sorted({i.slug for i in items
+                   if i.slug not in claimed and i.source not in claimed})
 
 
 def load_state() -> dict:
@@ -1442,10 +1429,12 @@ def compose_one(caller: Caller, entries: list[Entry], context: str,
           f"(+{SUMMARY_INFO.get('prompt', 0) + SUMMARY_INFO.get('completion', 0):,} shared summaries)")
 
     if kindle:
-        address, sender = config.get("kindle"), config.get("kindle_sender")
+        address = brief_def.kindle or config.get("kindle")
+        sender = brief_def.kindle_sender or config.get("kindle_sender")
         if not address or not sender:
             missing = "kindle" if not address else "kindle_sender"
-            print(f"{tag}   kindle: no '{missing} = ...' line in {CONFIG_FILE.name}")
+            print(f"{tag}   kindle: no '{missing} = ...' in "
+                  f"[brief.{brief_def.name}] (or top level) of {CONFIG_FILE.name}")
         else:
             try:
                 with tempfile.TemporaryDirectory() as tmp:
@@ -1515,7 +1504,6 @@ def run_brief(brief: BriefDef, items: list[Item], providers: list[Provider],
     written: list[Path] = []
     for provider in providers:
         # Tag the filename by brief, then by model only when comparing several.
-        # The default brief keeps the classic unlabeled "Sitrep <date>" name.
         parts = [brief.title, args.label] + ([provider.name] if multi else [])
         base = " ".join(x for x in parts if x)
         path = compose_one(Caller(provider, config), entries, context, ctxs,
@@ -1547,10 +1535,6 @@ def select_briefs(briefs: list[BriefDef], args) -> list[BriefDef]:
             sys.exit(f"unknown brief(s): {', '.join(unknown)}; "
                      f"configured: {', '.join(by_name)}")
         return [by_name[w] for w in wanted]
-    if args.journal_only:
-        # N identical context-only reports would be pointless; run just the
-        # default brief unless --brief says otherwise.
-        return [b for b in briefs if b.name == "default"]
     return briefs
 
 
@@ -1563,6 +1547,9 @@ def do_run(providers: list[Provider], config: dict, args) -> int:
 
     all_items = collect_items()
     partition = partition_items(all_items, briefs)
+    if orphans := unclaimed_sources(all_items, briefs):
+        print(f"note: {len(orphans)} archive source(s) claimed by no brief "
+              f"and never reported: {', '.join(orphans)}")
 
     if args.dry_run:
         for brief in selected:
@@ -1614,10 +1601,13 @@ def do_status(config: dict) -> int:
     state = load_state()
     print(f"state: {STATE_FILE}")
     print(f"last run: {state.get('last_run', 'never')}")
-    partition = partition_items(collect_items(), briefs)
+    all_items = collect_items()
+    partition = partition_items(all_items, briefs)
+    if orphans := unclaimed_sources(all_items, briefs):
+        print(f"unclaimed sources (never reported): {', '.join(orphans)}")
     last_reports = state.get("last_report") or {}
     for b in briefs:
-        srcs = "catch-all" if b.sources is None else f"{len(b.sources)} source(s)"
+        srcs = f"{len(b.sources)} source(s)"
         names = ", ".join(c.name for c in brief_ctxs(b, ctxs)) or "none"
         covered = len(reported_ids(b.name))
         pending = uncovered_for(partition[b.name], b.name)
