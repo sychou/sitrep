@@ -1,12 +1,39 @@
 # Sitrep
 
-Personalized intelligence briefs from a [gumshoe](https://github.com/sychou/gumshoe) archive.
+Synthesized intelligence briefs from an archive of collected content.
 
-Gumshoe gathers, sitrep reports. Sitrep reads what gumshoe filed since the
-last report, works out the topics, optionally cross-references them against
-the reader's own writing and archives, and composes one or more synthesized
-briefings — what the outside world said about the things the reader cares
-about. The two tools share one interface: the archive's markdown frontmatter.
+Sitrep reads a folder of markdown items — transcripts, articles,
+newsletters — works out the topics, optionally cross-references them against
+your own writing and archives, and composes one or more briefings: what the
+material says about the things you (or your audience) care about. Each brief
+is a single synthesized report with themes, action items, profiles of people
+and companies, and its own accounting — not a list of summaries.
+
+## The archive
+
+Sitrep reads any archive shaped as one folder per source, one markdown file
+per item, with YAML frontmatter:
+
+```markdown
+---
+source: "Example Podcast"
+source_type: "podcast"
+title: "Episode 42"
+url: "https://example.com/ep42"
+published: "2026-08-18"
+fetched: "2026-08-18T12:00:00+00:00"
+item_id: "a-stable-unique-id"
+---
+
+The item's full text (transcript, article body, newsletter text).
+```
+
+`item_id` is required and must be stable — it is how coverage is tracked, so
+an item is reported exactly once per brief. The folder name is the source
+slug that briefs reference. Anything that produces this shape works;
+[gumshoe](https://github.com/sychou/gumshoe) is one collector that does
+(YouTube transcripts, podcasts, blogs, email newsletters). Point sitrep at
+the archive with `[paths] archive` in config.
 
 ## Briefs
 
@@ -105,4 +132,4 @@ notes for anything that failed. A day with no new items produces no report.
 
 Reports are also copied into the folder named by `[paths] inbox_copy` when
 one is configured (for example an Obsidian vault inbox); that copy is
-disposable. The gumshoe archive is read-only to sitrep.
+disposable. The archive is read-only to sitrep.
